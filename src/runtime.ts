@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { createConversations } from './conversations.ts';
 import { createInbox } from './inbox.ts';
+import { createIdleSubscriptions } from './idle.ts';
 import { LIMITS, type Clock } from './limits.ts';
 import type { PeerHost } from './pi-adapter.ts';
 import { cleanName, parseEnvelope, ProtocolError, samePeer, type Ack, type Delivery, type Envelope, type MessageEnvelope, type PeerIdentity, type PeerRecord, type PeerView, type ReceiptEnvelope, type Transmission } from './protocol.ts';
@@ -14,13 +15,14 @@ export type SendResult = { message?: Transmission; subscription?: { id: string; 
 export function createRuntime(options: { identity: PeerIdentity; cwd: string; agentDir: string; clock: Clock; host: PeerHost }) {
   const { cwd, agentDir, clock, host } = options;
   const self = { ...options.identity, name: cleanName(options.identity.name) };
-  const inbox = createInbox(clock), conversations = createConversations(self, clock);
+  const inbox = createInbox(clock), conversations = createConversations(self, clock), idle = createIdleSubscriptions(self, clock);
   const lifetime = new AbortController(), controlLifetime = new AbortController();
   let state: 'starting' | 'active' | 'closing' | 'closed' = 'starting', paused = false;
   let registry: Registry | undefined, server: PeerServer | undefined, boot: Promise<void> | undefined, stopped: Promise<void> | undefined;
   let sweep: ReturnType<typeof setInterval> | undefined, noticeTimer: ReturnType<typeof setTimeout> | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
   const notices = new Set<string>(), controls = new Set<Promise<void>>();
-  const record: PeerRecord = { ...self, version: 1, pid: process.pid, cwd, endpoint: '', features: [] };
+  const record: PeerRecord = { ...self, version: 1, pid: process.pid, cwd, endpoint: '', features: ['notify_idle'] };
   const assertActive = () => { if (state !== 'active') throw new ProtocolError('unavailable'); };
   const info = (): PeerView => ({ ...record, activity: host.isIdle() && !host.hasPendingMessages() && !inbox.hasPending() ? 'idle' : 'busy', paused: paused || state !== 'active' });
   async function discover(): Promise<PeerView[]> {
@@ -53,6 +55,14 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
       if (text && state === 'active') host.notice(text, !paused);
     }, 500);
   }
+  function cancelIdleTimer() { clearTimeout(idleTimer); idleTimer = undefined; }
+  function scheduleIdle() {
+    if (state !== 'active' || paused || idleTimer || info().activity !== 'idle') return;
+    idleTimer = setTimeout(() => {
+      idleTimer = undefined;
+      for (const frame of idle.takeNotices('idle', state === 'active' && !paused && info().activity === 'idle')) control(frame);
+    }, LIMITS.idleDebounceMs); idleTimer.unref();
+  }
   function submit(m: MessageEnvelope) {
     if (state !== 'active' || paused) return;
     inbox.markSubmitted(m.messageId);
@@ -78,11 +88,15 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
       if (before !== after && (after === 'expired' || after === 'dropped')) notice('Peer request ' + frame.originalMessageId + ': ' + after + '. Do not automatically retry.');
       return ack;
     }
-    if (frame.kind === 'idle-subscribe' || frame.kind === 'idle-notice') throw new ProtocolError('unsupported_feature');
+    if (frame.kind === 'idle-subscribe') { idle.accept(frame); scheduleIdle(); return ack; }
+    if (frame.kind === 'idle-notice') {
+      if (idle.receive(frame)) notice('Peer ' + cleanName(frame.from.name) + ': ' + frame.state + ' (subscription ' + frame.subscriptionId + '). This is not confirmation of request completion.');
+      return ack;
+    }
     const duplicate = inbox.lookupDuplicate(frame); if (duplicate) return duplicate;
     conversations.validateIncoming(frame);
     const admitted = inbox.admit(frame);
-    if (admitted.status === 'accepted') { conversations.recordIncoming(frame); queueMicrotask(pump); }
+    if (admitted.status === 'accepted') { cancelIdleTimer(); conversations.recordIncoming(frame); queueMicrotask(pump); }
     return admitted;
   }
   const runtime = {
@@ -107,6 +121,11 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
             if (state !== 'active') return;
             for (const m of inbox.expire()) receipt(m, 'expired');
             for (const status of conversations.expire()) notice('Reply wait expired for ' + status.messageId + '; the remote action may have executed. Do not automatically retry.');
+            for (const frame of idle.expire()) {
+              if (samePeer(frame.to, self)) notice('Idle subscription ' + frame.subscriptionId + ' expired; no idle signal was confirmed.');
+              else control(frame);
+            }
+            scheduleIdle();
           }, 1000); sweep.unref();
         } catch (error) {
           await server?.close(); await registry?.removeOwn(self.instanceId);
@@ -117,29 +136,44 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
     },
     close(): Promise<void> {
       if (stopped) return stopped;
-      state = 'closing'; lifetime.abort(); clearInterval(sweep); clearTimeout(noticeTimer); notices.clear();
+      state = 'closing'; lifetime.abort(); cancelIdleTimer(); clearInterval(sweep); clearTimeout(noticeTimer); notices.clear();
       stopped = (async () => {
         await boot?.catch(() => {});
         await registry?.removeOwn(self.instanceId);
         for (const m of inbox.drain()) receipt(m, 'expired');
+        for (const frame of idle.takeNotices('exited', true)) control(frame);
         await server?.close();
         let timer: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([Promise.allSettled([...controls]), new Promise<void>(resolve => { timer = setTimeout(resolve, 1000); })]);
         clearTimeout(timer); controlLifetime.abort(); await Promise.allSettled([...controls]);
-        conversations.clear(); state = 'closed';
+        conversations.clear(); idle.clear(); state = 'closed';
       })();
       return stopped;
     },
     async list() { assertActive(); const peers = await discover(); assertActive(); return peers.filter(p => !samePeer(p, self)); },
     async send(input: SendInput, signal?: AbortSignal): Promise<SendResult> {
       assertActive();
-      if (!input.text?.trim()) throw new ProtocolError('empty_text');
-      if (input.notifyWhenIdle) throw new ProtocolError('unsupported_feature');
+      if (!input.text?.trim() && !input.notifyWhenIdle) throw new ProtocolError('empty_text');
       const target = registry!.resolve(input.to, await runtime.list()); assertActive();
-      const m: MessageEnvelope = { version: 1, messageId: randomUUID(), kind: input.kind ?? 'request', from: { ...self }, to: { sessionId: target.sessionId, instanceId: target.instanceId, name: target.name }, text: input.text, delivery: input.delivery ?? 'followUp', createdAt: clock.now() };
-      parseEnvelope(m); conversations.recordOutgoing(m);
-      const result = await transmit(m, signal); if (state === 'active') conversations.recordTransmission(m.messageId, result);
-      return { message: result };
+      const to = { sessionId: target.sessionId, instanceId: target.instanceId, name: target.name };
+      const result: SendResult = {};
+      if (input.text?.trim()) {
+        const m: MessageEnvelope = { version: 1, messageId: randomUUID(), kind: input.kind ?? 'request', from: { ...self }, to, text: input.text, delivery: input.delivery ?? 'followUp', createdAt: clock.now() };
+        parseEnvelope(m); conversations.recordOutgoing(m);
+        result.message = await transmit(m, signal);
+        if (state === 'active') conversations.recordTransmission(m.messageId, result.message);
+      }
+      if (input.notifyWhenIdle && state === 'active') {
+        if (!target.features.includes('notify_idle')) result.subscription = { id: '', status: 'unsupported_feature' };
+        else {
+          try {
+            const sub = idle.subscribe(to), transmission = await transmit(sub, signal);
+            if (transmission.status === 'rejected' || transmission.status === 'unavailable') idle.cancel(sub.subscriptionId);
+            result.subscription = { id: sub.subscriptionId, status: transmission.status };
+          } catch (error) { result.subscription = { id: '', status: error instanceof ProtocolError ? error.code : 'unavailable' }; }
+        }
+      }
+      return result;
     },
     async reply(input: ReplyInput, signal?: AbortSignal): Promise<Transmission> {
       assertActive();
@@ -148,13 +182,14 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
       return result;
     },
     status(id?: string) { return conversations.getStatus(id); },
-    pause() { if (state !== 'active') return; paused = true; inbox.setPaused(true); },
-    resume() { if (state !== 'active') return; paused = false; inbox.setPaused(false); pump(); },
+    onBusy() { cancelIdleTimer(); },
+    pause() { if (state !== 'active') return; cancelIdleTimer(); paused = true; inbox.setPaused(true); },
+    resume() { if (state !== 'active') return; paused = false; inbox.setPaused(false); pump(); scheduleIdle(); },
     async rename(name: string) { assertActive(); self.name = record.name = cleanName(name); await registry!.updateName(self.instanceId, self.name); },
     onSettled(aborted: boolean) {
       if (state !== 'active') return;
       if (aborted) { runtime.pause(); host.notice('Peer intake paused after abort. Use /peers resume to continue.', false); }
-      else pump();
+      else { pump(); scheduleIdle(); }
     },
     observeContext(ids: string[]) { if (state === 'active') inbox.observeContext(ids); },
   };
