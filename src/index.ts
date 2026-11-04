@@ -21,7 +21,11 @@ export default function peerCommunication(pi: ExtensionAPI) {
   });
   pi.on('session_shutdown', async () => { const old = runtime; runtime = undefined; await old?.close(); });
   pi.on('session_info_changed', async (event, ctx) => { await runtime?.rename(event.name ?? basename(ctx.cwd)); });
+  pi.on('session_before_compact', event => runtime?.beginMaintenance(event.signal));
+  pi.on('session_before_tree', event => runtime?.beginMaintenance(event.signal));
+  pi.on('session_compact_failed', event => { if (event.aborted) runtime?.onSettled(true); });
   pi.on('agent_start', () => runtime?.onBusy());
   pi.on('agent_settled', event => runtime?.onSettled(event.aborted));
+  pi.on('message_start', event => { if (runtime) runtime.observeStarted(observedPeerIds([event.message], runtime.info().instanceId)); });
   pi.on('context', event => { if (runtime) runtime.observeContext(observedPeerIds(event.messages, runtime.info().instanceId)); });
 }

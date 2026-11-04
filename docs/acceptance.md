@@ -6,14 +6,14 @@
 
 | 命令 | 验证内容 |
 |---|---|
-| `pnpm test:unit` | 协议/边界/权限/注册/队列/限流/关联/状态乱序/空闲/工具/UI；34 个用例 |
+| `pnpm test:unit` | 协议/边界/权限/注册/队列/限流/关联/状态乱序/空闲/工具/UI；35 个用例 |
 | `pnpm test:integration` | 独立 Node 进程、真实 UDS、认证、分帧、ACK 丢失、收件后关停、空闲通知；10 个用例 |
-| `pnpm test:e2e` | 真实 Pi RPC 与真实 Pi TUI、loopback 假模型、打包入口；6 个用例 |
+| `pnpm test:e2e` | 真实 Pi RPC 与真实 Pi TUI、loopback 假模型、打包入口；9 个用例 |
 | `pnpm typecheck` | TypeScript 与已安装 Pi API 类型检查 |
 | `git diff --check` | 补丁空白检查 |
 | `pnpm pack --pack-destination /tmp/pi-communication-pack` | 归档仅含 manifest、README、src；无 .pi、token、注册表、日志或测试 |
 
-逐层命令已执行；总计 50 个用例通过。打包测试重新生成归档、检查每个路径、解包，然后以临时 agent directory 加载包目录，验证 manifest 入口与 `/peers` 可用。最终审查若增加回归用例，以最新测试输出为准。
+逐层命令已执行；总计 54 个用例通过。打包测试重新生成归档、检查每个路径、解包，然后以临时 agent directory 加载包目录，验证 manifest 入口与 `/peers` 可用。最终审查若增加回归用例，以最新测试输出为准。
 
 ### 真实 Pi RPC
 
@@ -39,6 +39,19 @@
 - 真实监听器在收件回调未完成时关闭：发送者 unknown，新连接 unavailable，计数仍为 1。
 - submitted 回执先于发送 ACK、终态 expired 后迟到 submitted、reply 先于发送 ACK：不把状态倒退为 accepted。
 - 运行时关闭保留队列、注入异常、重复关闭、启动中关闭：不启动新的模型任务或留下可发现的幽灵实例。
+
+## 独立审查后的修正
+
+独立只读审查使用 `openai-codex-1/gpt-6.1-sol:high`；审查员没有执行工具，以下复现与验证由实施会话完成，没有声称审查员独立运行测试。
+
+- **手动压缩/树导航调度**：真实 Pi 测试先复现压缩成功后 followUp 未处理，再修复为通过忙状态与 abort signal 跟踪保留消息；每秒检查最终空闲后恢复调度。steer 也不进入独立压缩/树导航。实际 PTY 新增压缩中 Esc 暂停验证。
+- **异步 settled FIFO**：用另一个扩展延长 settled 回调，复现处理顺序 M1、M3、M2；增加单条空闲注入交接标记，在对应消息实际开始或进入 context 后释放。回归顺序为 M1、M2、M3。
+- **人类界面来源伪造**：将评审的 Minor 升级为 Important；实际多行伪标题测试先失败，现每条正文与折行都有引用栏，来源头单独着色。模型侧仍使用 JSON 数据与权限警示。
+- 全套验证最终为 35 单元 + 10 集成 + 9 E2E，类型与补丁检查通过。修正期间发现测试把 message_end 当作空闲的时序错误，已改为等待 agent_settled。
+
+### 暂缓的小问题
+
+关闭时若存在很多不响应的注册实例，等待控制消息的 **1 秒不是硬期限**：发现流程尚不能被 AbortSignal 中途取消，需要等待当前全注册表探测完成。工具取消同样可能延迟。单个探测有期限，不自动重发业务；后续可改为精确实例查询及可取消发现。
 
 ## 未验证项及边界
 

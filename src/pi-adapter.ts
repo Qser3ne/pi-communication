@@ -2,13 +2,14 @@ import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-a
 import { cleanDisplay, formatPeerContent, type MessageEnvelope } from './protocol.ts';
 export interface PeerHost {
   isIdle(): boolean;
+  isRunning(): boolean;
   hasPendingMessages(): boolean;
   inject(message: MessageEnvelope): void;
   notice(text: string, modelVisible: boolean): void;
 }
 export function createPiHost(pi: ExtensionAPI, ctx: ExtensionContext): PeerHost {
   return {
-    isIdle: () => ctx.isIdle(), hasPendingMessages: () => ctx.hasPendingMessages(),
+    isIdle: () => ctx.isIdle(), isRunning: () => !!ctx.signal && !ctx.signal.aborted, hasPendingMessages: () => ctx.hasPendingMessages(),
     inject(message) {
       pi.sendMessage({ customType: 'peer-message', content: formatPeerContent(message), display: true, details: { messageId: message.messageId, instanceId: message.to.instanceId, message } }, { triggerTurn: true, deliverAs: message.delivery });
     },

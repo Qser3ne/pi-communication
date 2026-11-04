@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { mkdtemp,mkdir,writeFile,readFile,rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';import { join } from 'node:path';
+import { tmpdir } from 'node:os';import { join,resolve } from 'node:path';
 import { fakeModel, content, type Completion, type ChatRequest } from '../fixtures/fake-model-server.ts';
 import { rpcPeer,type RpcPeer } from '../helpers/rpc-peer.ts';import { resolvePaths } from '../../src/registry.ts';
 let dir:string,peers:RpcPeer[]=[],server:Awaited<ReturnType<typeof fakeModel>>|undefined;
@@ -15,7 +15,7 @@ afterEach(async()=>{
 async function setup(respond:(r:ChatRequest)=>Completion|Promise<Completion>){
   server=await fakeModel(respond);
   await writeFile(join(dir,'models.json'),JSON.stringify({providers:{fake:{baseUrl:server.url+'/v1',api:'openai-completions',apiKey:'local-test-only',models:['A','B'].map(id=>({id,contextWindow:128000,maxTokens:1024}))}}}));
-  await writeFile(join(dir,'settings.json'),JSON.stringify({retry:{enabled:false},compaction:{enabled:false},quietStartup:true}));
+  await writeFile(join(dir,'settings.json'),JSON.stringify({retry:{enabled:false},compaction:{enabled:false,keepRecentTokens:20},quietStartup:true}));
   const create=async(name:string,extra:string[]=[])=>{const cwd=join(dir,name+'-'+peers.length);await mkdir(cwd);const peer=rpcPeer(dir,cwd,name,extra);peers.push(peer);await peer.command('get_state');return peer;};
   return create;
 }
@@ -49,6 +49,82 @@ it('supports Pi custom session IDs without using them as file paths',async()=>{
   expect((await call(a,'peer_list')).peers[0].sessionId).toBe('review.session-42');
   expect((await call(a,'peer_send',{to:'review.session-42',text:'custom ID',kind:'notification'})).message.status).toBe('accepted');
   await b.wait(e=>e.type==='message_end'&&e.message?.details?.message?.text==='custom ID');
+},60000);
+it('drains followUp after standalone manual compaction and pauses on compaction abort',async()=>{
+  let release!:()=>void,started!:()=>void;
+  let gate=Promise.resolve(),entered=Promise.resolve();
+  const hold=()=>{gate=new Promise<void>(r=>release=r);entered=new Promise<void>(r=>started=r);};
+  const create=await setup(async request=>{
+    if(request.model==='B'&&!request.tools?.length){started();await gate;return {text:'A compact summary.'};}
+    return scripted(request);
+  });
+  const a=await create('A'),b=await create('B');
+  await b.prompt('seed '.repeat(300));await b.prompt('more '.repeat(300));
+  hold();const compact=b.command('compact').catch(error=>({error:String(error)}));await entered;
+  await call(a,'peer_send',{to:'B',text:'after-compact',kind:'notification'});
+  expect(delivered(b,'notification')).toHaveLength(0);
+  release();expect((await compact).error).toBeUndefined();
+  await b.wait(e=>e.type==='message_end'&&e.message?.details?.message?.text==='after-compact',0,4000);
+  await b.wait(e=>e.type==='agent_settled',b.events.findIndex(e=>e.type==='message_end'&&e.message?.details?.message?.text==='after-compact'));
+  await b.prompt('another '.repeat(300));
+  hold();const aborting=b.command('compact').catch(error=>({error:String(error)}));await entered;
+  await call(a,'peer_send',{to:'B',text:'held-steer',kind:'notification',delivery:'steer'});
+  expect(delivered(b,'notification')).toHaveLength(1);
+  await b.command('clear_queue');await b.command('abort');release();await aborting;
+  expect((await call(a,'peer_list')).peers[0].paused).toBe(true);
+  expect(delivered(b,'notification')).toHaveLength(1);
+  await b.command('prompt',{message:'/peers resume'});
+  await b.wait(e=>e.type==='message_end'&&e.message?.details?.message?.text==='held-steer');
+},60000);
+it('preserves followUp FIFO across asynchronous settled handlers and nested runs',async()=>{
+  let releaseFirst!:()=>void,releaseM1!:()=>void,firstStarted!:()=>void,m1Started!:()=>void;
+  const firstGate=new Promise<void>(r=>releaseFirst=r),m1Gate=new Promise<void>(r=>releaseM1=r);
+  const firstEntered=new Promise<void>(r=>firstStarted=r),m1Entered=new Promise<void>(r=>m1Started=r);
+  const create=await setup(async request=>{
+    const text=content(request.messages.at(-1)),data=peerData(text);
+    if(request.model==='B'&&text==='HOLD'){firstStarted();await firstGate;}
+    if(request.model==='B'&&data?.text==='M1'){m1Started();await m1Gate;}
+    return scripted(request);
+  });
+  const a=await create('A'),b=await create('B',['-e',resolve('tests/fixtures/settled-delay.ts')]);
+  try{
+    await writeFile(join(b.cwd,'hold-settled'),'1');
+    await b.command('prompt',{message:'HOLD'});await firstEntered;
+    await call(a,'peer_send',{to:'B',text:'M1',kind:'notification'});
+    releaseFirst();
+    await b.wait(e=>e.type==='extension_ui_request'&&e.message==='settled-held');
+    await call(a,'peer_send',{to:'B',text:'M2',kind:'notification'});
+    await writeFile(join(b.cwd,'release-settled'),'1');await m1Entered;
+    await call(a,'peer_send',{to:'B',text:'M3',kind:'notification'});
+    releaseM1();
+    await b.wait(e=>e.type==='message_end'&&e.message?.details?.message?.text==='M2');
+    await b.wait(e=>e.type==='message_end'&&e.message?.details?.message?.text==='M3');
+    expect(delivered(b,'notification').map(e=>e.message.details.message.text)).toEqual(['M1','M2','M3']);
+  }finally{releaseFirst();releaseM1();await writeFile(join(b.cwd,'release-settled'),'1');}
+},60000);
+it('holds steer during tree navigation and resumes only after non-aborted completion',async()=>{
+  let release!:()=>void,started!:()=>void;
+  let gate=Promise.resolve(),entered=Promise.resolve();
+  const hold=()=>{gate=new Promise<void>(r=>release=r);entered=new Promise<void>(r=>started=r);};
+  const create=await setup(async request=>{
+    if(request.model==='B'&&!request.tools?.length){started();await gate;return {text:'Tree summary.'};}
+    return scripted(request);
+  });
+  const a=await create('A'),b=await create('B',['-e',resolve('tests/fixtures/tree-navigation.ts')]);
+  try{
+    for(const abort of [false,true]){
+      await b.prompt('tree seed '+String(abort));await b.prompt('later branch');
+      hold();const navigating=b.command('prompt',{message:'/test-tree'}).catch(error=>({error:String(error)}));await entered;
+      const text=abort?'after-tree-abort':'after-tree';
+      await call(a,'peer_send',{to:'B',text,kind:'notification',delivery:'steer'});
+      expect(delivered(b,'notification').some(e=>e.message.details.message.text===text)).toBe(false);
+      if(abort){await b.command('abort');expect((await call(a,'peer_list')).peers[0].paused).toBe(true);}
+      release();await navigating;
+      if(abort)await b.command('prompt',{message:'/peers resume'});
+      await b.wait(e=>e.type==='message_end'&&e.message?.details?.message?.text===text);
+      await b.wait(e=>e.type==='agent_settled',b.events.findIndex(e=>e.type==='message_end'&&e.message?.details?.message?.text===text));
+    }
+  }finally{release?.();}
 },60000);
 function scripted(request:ChatRequest):Completion {
   const last=request.messages.at(-1),text=content(last);

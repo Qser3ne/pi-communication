@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { Text } from '@earendil-works/pi-tui';
+import { Text, truncateToWidth, type Component } from '@earendil-works/pi-tui';
 import { cleanDisplay, cleanName, parseEnvelope, type MessageEnvelope, type PeerView } from './protocol.ts';
 import type { PeerRuntime } from './runtime.ts';
 
@@ -8,18 +8,35 @@ export function peerLabel(peer: PeerView, peers: PeerView[]): string {
   while(length<36 && peers.some(other=>other.instanceId!==peer.instanceId && other.instanceId.startsWith(peer.instanceId.slice(0,length)))) length++;
   return cleanName(peer.name)+' ['+peer.instanceId.slice(0,length)+']';
 }
-export function renderPeerText(message: MessageEnvelope, expanded: boolean): string {
+function peerParts(message: MessageEnvelope, expanded: boolean) {
   const text=cleanDisplay(message.text), max=expanded?50000:1000;
-  return 'Peer · '+cleanName(message.from.name)+' · '+message.kind+' · '+message.messageId.slice(0,8)+'\n'+text.slice(0,max)+(text.length>max?'\n… (display truncated; full content remains in session history)':'');
+  return {header:'Peer · '+cleanName(message.from.name)+' · '+message.kind+' · '+message.messageId.slice(0,8),body:text.slice(0,max)+(text.length>max?'\n… (display truncated; full content remains in session history)':'')};
+}
+export function renderPeerText(message: MessageEnvelope, expanded: boolean): string {
+  const {header,body}=peerParts(message,expanded);
+  return header+'\n'+body.split('\n').map(line=>'│ '+line).join('\n');
+}
+function quotedComponent(header: string, body: string, padding: number, style: (text:string)=>string): Component {
+  return {
+    render(width) {
+      if (width < 1) return [];
+      const pad=Math.min(padding,Math.max(0,Math.floor((width-1)/2))),inner=width-pad*2;
+      const headerLines=new Text(style(header),0,0).render(inner);
+      const bodyLines=new Text(body,0,0).render(Math.max(1,inner-2)).map(line=>truncateToWidth('│ '+line,inner));
+      return [...headerLines,...bodyLines].map(line=>' '.repeat(pad)+truncateToWidth(line,inner)+' '.repeat(pad));
+    },
+    invalidate() {},
+  };
 }
 export function registerPeerUi(pi: ExtensionAPI, getRuntime: () => PeerRuntime | undefined): void {
-  pi.registerMessageRenderer('peer-message',(message,options)=>{
+  pi.registerMessageRenderer('peer-message',(message,options,theme)=>{
+    const style=(text:string)=>theme ? theme.fg('accent',text) : text;
     try {
       const details=message.details as {message?:unknown}|undefined;
       const frame=parseEnvelope(details?.message);
-      if ('text' in frame) return new Text(renderPeerText(frame,options.expanded),options.outputPad,0);
+      if ('text' in frame) { const {header,body}=peerParts(frame,options.expanded); return quotedComponent(header,body,options.outputPad,style); }
     } catch { /* Old or damaged session metadata is not trusted. */ }
-    return new Text('Peer · '+cleanDisplay(typeof message.content==='string'?message.content:'[unavailable]'),options.outputPad,0);
+    return quotedComponent('Peer · unavailable metadata',cleanDisplay(typeof message.content==='string'?message.content:'[unavailable]'),options.outputPad,style);
   });
   pi.registerMessageRenderer('peer-notice',(message,options)=>new Text(cleanDisplay(typeof message.content==='string'?message.content:'Peer status'),options.outputPad,0));
   pi.registerEntryRenderer('peer-notice',(entry,options)=>{

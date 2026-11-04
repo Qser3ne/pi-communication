@@ -21,10 +21,12 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
   let registry: Registry | undefined, server: PeerServer | undefined, boot: Promise<void> | undefined, stopped: Promise<void> | undefined;
   let sweep: ReturnType<typeof setInterval> | undefined, noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let maintenance: { cleanup(): void } | undefined;
+  let handoff: string | undefined;
   const notices = new Set<string>(), controls = new Set<Promise<void>>();
   const record: PeerRecord = { ...self, version: 1, pid: process.pid, cwd, endpoint: '', features: ['notify_idle'] };
   const assertActive = () => { if (state !== 'active') throw new ProtocolError('unavailable'); };
-  const info = (): PeerView => ({ ...record, activity: host.isIdle() && !host.hasPendingMessages() && !inbox.hasPending() ? 'idle' : 'busy', paused: paused || state !== 'active' });
+  const info = (): PeerView => ({ ...record, activity: !handoff && host.isIdle() && !host.hasPendingMessages() && !inbox.hasPending() ? 'idle' : 'busy', paused: paused || state !== 'active' });
   async function discover(): Promise<PeerView[]> {
     if (!registry) return [];
     return registry.discover(async r => probePeer(r, await registry!.readToken(r.instanceId)));
@@ -49,11 +51,16 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
   function notice(text: string) {
     if (state !== 'active') return;
     if (notices.size < LIMITS.controls) notices.add(text);
-    if (!noticeTimer) noticeTimer = setTimeout(() => {
-      noticeTimer = undefined;
-      const text = [...notices].join('\n'); notices.clear();
-      if (text && state === 'active') host.notice(text, !paused);
-    }, 500);
+    if (!noticeTimer) noticeTimer = setTimeout(flushNotices, 500);
+  }
+  function flushNotices() {
+    noticeTimer = undefined;
+    if (state !== 'active') return;
+    if (!paused && (maintenance || (!host.isIdle() && !host.isRunning()))) {
+      noticeTimer = setTimeout(flushNotices, 500); return;
+    }
+    const text = [...notices].join('\n'); notices.clear();
+    if (text) host.notice(text, !paused);
   }
   function cancelIdleTimer() { clearTimeout(idleTimer); idleTimer = undefined; }
   function scheduleIdle() {
@@ -66,15 +73,18 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
   function submit(m: MessageEnvelope) {
     if (state !== 'active' || paused) return;
     inbox.markSubmitted(m.messageId);
+    if (host.isIdle()) handoff = m.messageId;
     try { host.inject(m); receipt(m, 'submitted'); }
-    catch { inbox.drop(m.messageId); receipt(m, 'dropped'); }
+    catch { if (handoff === m.messageId) handoff = undefined; inbox.drop(m.messageId); receipt(m, 'dropped'); }
   }
   function pump() {
-    if (state !== 'active' || paused) return;
+    if (state !== 'active') return;
+    if (maintenance && host.isIdle()) { maintenance.cleanup(); maintenance = undefined; }
+    if (paused || maintenance || handoff || (!host.isIdle() && !host.isRunning())) return;
     for (const m of inbox.expire()) receipt(m, 'expired');
     let m: MessageEnvelope | undefined;
-    while ((m = inbox.take('steer'))) submit(m);
-    if (host.isIdle() && !host.hasPendingMessages()) { m = inbox.take('followUp'); if (m) submit(m); }
+    while (!handoff && (m = inbox.take('steer'))) submit(m);
+    if (!handoff && host.isIdle() && !host.hasPendingMessages()) { m = inbox.take('followUp'); if (m) submit(m); }
   }
   async function onFrame(frame: Envelope): Promise<Ack> {
     assertActive();
@@ -125,7 +135,7 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
               if (samePeer(frame.to, self)) notice('Idle subscription ' + frame.subscriptionId + ' expired; no idle signal was confirmed.');
               else control(frame);
             }
-            scheduleIdle();
+            pump(); scheduleIdle();
           }, 1000); sweep.unref();
         } catch (error) {
           await server?.close(); await registry?.removeOwn(self.instanceId);
@@ -136,7 +146,7 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
     },
     close(): Promise<void> {
       if (stopped) return stopped;
-      state = 'closing'; lifetime.abort(); cancelIdleTimer(); clearInterval(sweep); clearTimeout(noticeTimer); notices.clear();
+      state = 'closing'; maintenance?.cleanup(); maintenance = undefined; lifetime.abort(); cancelIdleTimer(); clearInterval(sweep); clearTimeout(noticeTimer); notices.clear();
       stopped = (async () => {
         await boot?.catch(() => {});
         await registry?.removeOwn(self.instanceId);
@@ -183,6 +193,14 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
     },
     status(id?: string) { return conversations.getStatus(id); },
     onBusy() { cancelIdleTimer(); },
+    beginMaintenance(signal: AbortSignal) {
+      if (state !== 'active') return;
+      maintenance?.cleanup(); cancelIdleTimer();
+      const aborted = () => runtime.onSettled(true);
+      maintenance = { cleanup: () => signal.removeEventListener('abort', aborted) };
+      signal.addEventListener('abort', aborted, { once: true });
+      if (signal.aborted) aborted();
+    },
     pause() { if (state !== 'active') return; cancelIdleTimer(); paused = true; inbox.setPaused(true); },
     resume() { if (state !== 'active') return; paused = false; inbox.setPaused(false); pump(); scheduleIdle(); },
     async rename(name: string) { assertActive(); self.name = record.name = cleanName(name); await registry!.updateName(self.instanceId, self.name); },
@@ -191,7 +209,8 @@ export function createRuntime(options: { identity: PeerIdentity; cwd: string; ag
       if (aborted) { runtime.pause(); host.notice('Peer intake paused after abort. Use /peers resume to continue.', false); }
       else { pump(); scheduleIdle(); }
     },
-    observeContext(ids: string[]) { if (state === 'active') inbox.observeContext(ids); },
+    observeStarted(ids: string[]) { if (handoff && ids.includes(handoff)) handoff = undefined; },
+    observeContext(ids: string[]) { if (state === 'active') { runtime.observeStarted(ids); inbox.observeContext(ids); } },
   };
   return runtime;
 }

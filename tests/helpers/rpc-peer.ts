@@ -23,7 +23,7 @@ export function rpcPeer(agentDir:string,cwd:string,name:string,extra:string[]=[]
     child.stdin.write(JSON.stringify({id,type,...args})+'\n');
     const r=await response;if(!r.success)throw new Error(r.error);return r.data;
   }
-  return {events,wait,command,pid:child.pid,get stderr(){return stderr;},
+  return {events,wait,command,cwd,pid:child.pid,get stderr(){return stderr;},
     async prompt(message:string){const cursor=events.length;await command('prompt',{message});await wait(e=>e.type==='agent_settled',cursor);},
     async close(){if(ended)return;child.stdin.end();const kill=setTimeout(()=>child.kill('SIGKILL'),6000);await closed;clearTimeout(kill);},
   };
