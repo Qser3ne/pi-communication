@@ -7,7 +7,7 @@ export class ProtocolError extends Error {
   constructor(public readonly code: string) { super(code); this.name = 'ProtocolError'; }
 }
 export const Uuid = Type.String({ pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' });
-export const IdentitySchema = Type.Object({ sessionId: Uuid, instanceId: Uuid, name: Type.String({ maxLength: 128 }) }, { additionalProperties: false });
+export const IdentitySchema = Type.Object({ sessionId: Type.String({ minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$' }), instanceId: Uuid, name: Type.String({ maxLength: 128 }) }, { additionalProperties: false });
 export type PeerIdentity = Static<typeof IdentitySchema>;
 export type Delivery = 'followUp' | 'steer';
 const delivery = Type.Union([Type.Literal('followUp'), Type.Literal('steer')]);

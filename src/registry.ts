@@ -1,8 +1,7 @@
-import { constants } from 'node:fs';
+import { constants, realpathSync } from 'node:fs';
 import { lstat, mkdir, open, readFile, readdir, rename, unlink, link } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
 import { cleanName, parseRecord, ProtocolError, samePeer, type PeerRecord, type PeerView } from './protocol.ts';
 
 export type RegistryPaths = { root: string; sessionsDir: string; keysDir: string; socketDir: string };
@@ -11,7 +10,7 @@ export function resolvePaths(agentDir: string, configRoot?: string): RegistryPat
   const root = configRoot ?? join(agentDir, 'communication');
   if (!isAbsolute(root)) throw new ProtocolError('unsafe_path');
   const hash = createHash('sha256').update(root).digest('hex').slice(0, 12);
-  const socketDir = join('/tmp', `pi-peer-${process.getuid?.() ?? 0}-${hash}`);
+  const socketDir = join(realpathSync('/tmp'), `pi-peer-${process.getuid?.() ?? 0}-${hash}`);
   return { root, sessionsDir: join(root, 'sessions'), keysDir: join(root, 'keys'), socketDir };
 }
 export async function assertNoSymlinks(path: string): Promise<void> {

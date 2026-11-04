@@ -14,6 +14,14 @@ describe('request correlation',()=>{
     expect(c.getStatus(req.messageId)[0]).toMatchObject({response:'replied',replyMessageId:reply.messageId,outcome:'ok',delivery:'submitted'});
     expect(()=>c.validateIncoming({...reply,messageId:identity().sessionId})).toThrow('bad_reply');
   });
+  it('keeps terminal receipts stable when delayed submitted receipts arrive',()=>{
+    const self=identity('A'),other=identity('B'),c=createConversations(self,Date),req=message({from:self,to:other});
+    c.recordOutgoing(req);
+    const receipt={version:1 as const,kind:'receipt' as const,messageId:identity().sessionId,from:other,to:self,originalMessageId:req.messageId,state:'expired' as const};
+    c.applyReceipt(receipt);c.recordTransmission(req.messageId,{messageId:req.messageId,status:'accepted'});
+    c.applyReceipt({...receipt,state:'submitted'});
+    expect(c.getStatus(req.messageId)[0]?.delivery).toBe('expired');
+  });
   it('reserves one explicit reply attempt and cannot reply to a reply or notification',()=>{
     const self=identity('B'),c=createConversations(self,{now:()=>0}),req=message({to:self});
     c.validateIncoming(req);c.recordIncoming(req);

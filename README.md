@@ -79,4 +79,6 @@ pnpm typecheck
 git diff --check
 ```
 
+Linux 验收记录见 [docs/acceptance.md](docs/acceptance.md)（源码仓库内）。端到端测试还需要 Python 3、POSIX PTY 和 tar。
+
 集成测试用真实 IPC；端到端测试用独立 Pi 进程及本地假模型，不需要真实模型密钥，不证明真实模型一定遵从协作指令。实际模型验收需另行授权。

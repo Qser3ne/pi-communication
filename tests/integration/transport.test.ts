@@ -61,6 +61,16 @@ describe('real Unix IPC',()=>{
     const m=message({to:{sessionId:r.sessionId,instanceId:r.instanceId,name:r.name}});
     expect((await sendFrame(r,token,m)).status).toBe('unknown');expect(count).toBe(1);
   });
+  it('closing after admission but before ACK yields unknown once and rejects new connections',async()=>{
+    const r=record();let count=0,release!:()=>void,admitted!:()=>void;
+    const held=new Promise<void>(resolve=>release=resolve),received=new Promise<void>(resolve=>admitted=resolve);
+    server=await listenPeer({record:r,token,getView:()=>({...r,activity:'idle',paused:false}),onFrame:async f=>{count++;admitted();await held;return {messageId:f.messageId,status:'accepted'};}});
+    const frame=message({to:{sessionId:r.sessionId,instanceId:r.instanceId,name:r.name}});
+    const sending=sendFrame(r,token,frame);await received;
+    await server.close();expect((await sending).status).toBe('unknown');release();
+    expect((await sendFrame(r,token,message({to:frame.to}))).status).toBe('unavailable');
+    expect(count).toBe(1);
+  });
   it('parses fragmented UTF8 exactly once and rejects missing auth',async()=>{
     const r=record(),seen:Envelope[]=[];
     server=await listenPeer({record:r,token,getView:()=>({...r,activity:'idle',paused:false}),onFrame:async f=>{seen.push(f);return {messageId:f.messageId,status:'accepted'};}});
