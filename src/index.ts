@@ -3,9 +3,13 @@ import { basename } from 'node:path';
 import { getAgentDir, VERSION, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { createPiHost, observedPeerIds } from './pi-adapter.ts';
 import { createRuntime, type PeerRuntime } from './runtime.ts';
+import { registerPeerTools } from './tools.ts';
+import { registerPeerUi } from './ui.ts';
 
 export default function peerCommunication(pi: ExtensionAPI) {
   let runtime: PeerRuntime | undefined;
+  registerPeerTools(pi, () => runtime);
+  registerPeerUi(pi, () => runtime);
   pi.on('session_start', async (_event, ctx) => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') throw new Error('pi-communication supports Linux/macOS only');
     const [major=0,minor=0] = VERSION.split('.').map(Number);
