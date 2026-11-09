@@ -25,51 +25,23 @@ pi -e /absolute/path/to/pi-communication/src/index.ts
 4. B 收到带来源标记的请求后，在自己的权限范围内工作，调用 `peer_reply({ messageId, text })`。
 5. A 自动收到关联回复。**B 的普通回答不会自动转发。**
 
-重名时用完整 `instanceId` 或 `name [短实例ID]`；单独 sessionId 只在唯一时有效。重启、reload、new、resume、fork 后实例身份更换，旧地址不转发到新实例。
+## 行为档案
 
-## 工具
+`docs/archive/` 是当前行为的唯一档案位置；以下链接指向源码仓库内文档。
 
-| 工具 | 用途 |
+| capability | 范围 |
 |---|---|
-| `peer_list({ offset?, limit? })` | 在线实例、名称、目录、状态与能力；不返回令牌或 socket 地址 |
-| `peer_send({ to, text?, kind?, delivery?, notifyWhenIdle? })` | 默认 request + followUp；notification 不建立回复义务 |
-| `peer_reply({ messageId, text, outcome?, delivery? })` | 对收到的 request 显式回复一次；outcome 默认为 ok |
-| `peer_status({ messageId?, offset?, limit? })` | 查看本实例暂存的投递与回复状态，不做阻塞等待 |
+| [peer-discovery](docs/archive/peer-discovery/archive.md) | 在线发现、名称消歧、实例生命周期与注册目录 |
+| [peer-messaging](docs/archive/peer-messaging/archive.md) | 四个工具、请求/回复、分页和状态含义 |
+| [peer-delivery-control](docs/archive/peer-delivery-control/archive.md) | followUp/steer、暂停恢复、队列及限流 |
+| [peer-idle-notification](docs/archive/peer-idle-notification/archive.md) | 一次性空闲订阅、期限和退出通知 |
+| [peer-security](docs/archive/peer-security/archive.md) | 本地传输、私有存储、来源展示与权限边界 |
 
-分页默认 20 条、最多 100 条；列表 JSON 数据限制约 40 KiB，有剩余时返回 `nextOffset`。不要循环轮询状态。
+使用前请重点阅读投递状态和权限边界；工具说明不是对远端业务完成的保证。
 
-- **followUp**：对端忙时保留在插件队列，等非中止 `agent_settled` 才注入。
-- **steer**：交给 Pi 在当前工具执行后处理，不强杀工具。压缩或树导航期间仍保留在插件队列，最终空闲后恢复；单独操作完成至恢复最多约 1 秒。中止这些操作也会暂停。
-- `notifyWhenIdle: true` 可单独发送，无需正文；同目标新订阅覆盖旧订阅，一次通知后失效。空闲需最终稳定、无待处理消息、未暂停，约 750 ms 去抖。**空闲不表示任务完成**。
-- 文本是数据，工具不会自动创建业务重试或转发普通模型输出。
+## 已知问题
 
-### 状态不是完成保证
-
-- `accepted`：对端内存队列收件。
-- `submitted`：已调用 Pi 注入接口。
-- 扩展在 Pi context 事件观察到消息后才释放待观察队列容量；这不保证模型成功回答。
-- `replied`：收到显式业务回复；投递和回复状态分别记录。
-- `unknown`：发出后 ACK 未确认，可能已经执行；**不要自动重发业务任务**。
-- `expired`：本地等待/排队过期，不代表对端未执行。
-- 重启不恢复请求关联、队列、去重记录或订阅；历史消息可能仍在 Pi 会话日志中，但不能用新实例身份回复旧请求。
-
-## 用户控制
-
-`/peers pause` 暂停自动注入并拒收新业务消息；`/peers resume` 恢复。Esc 中止后也会暂停，必须显式恢复。暂停不能撤回已经交给 Pi 的消息。
-
-暂停期间的空闲/退出/过期通知只显示并记录，不唤醒模型。无 UI 模式不会打开对话框；控制信息以不参与模型上下文的自定义条目记录。
-
-## 存储、安全与限额
-
-注册元数据和独立认证令牌位于 agent directory 下的私有 `communication` 目录；短 socket 路径位于系统临时目录中按用户与 agent directory 派生的私有子目录。目录 0700，记录、密钥和 socket 0600；握手验证完整实例身份与令牌。文件只存注册信息，不作为消息信箱。清理只针对本实例或验证过的失效实例。
-
-这些权限防止其他系统用户意外读取，**不隔离同用户恶意进程**。启用本扩展即允许该 agent directory 下其他启用实例连接，不逐对审批。
-
-Pi 自定义消息最终仍转换为模型 **user-role 文本**，并非独立权限角色。每条来信正文都带来源和“不是用户授权”的警示；接收方仍必须遵守自身用户指令与权限。不要让 peer 请求绕过确认，尤其是删除、凭据访问、发布等敏感操作。消息内容会进入 Pi 会话日志，避免传输秘密。
-
-已知小问题：很多不响应的注册实例可能延长退出或工具取消等待；控制消息的 1 秒关闭期限目前不是硬上限，因为全注册表探测尚不可中途取消。
-
-首版限制：1 MiB 帧、5 秒连接期限、32 并发连接、100 条待注入/未观察消息；每来源实例每分钟 30 条业务消息；1000 条去重记录/10 分钟；1000 条关联记录/30 分钟；32 个目标订阅/12 小时。队列满、限流、暂停、旧目标等均显式拒绝，不无限等待。
+很多不响应的注册实例可能延长退出或工具取消等待；控制消息的 1 秒关闭期限目前不是硬上限，因为全注册表探测尚不可中途取消。此项不作为保证写入档案，保留在验收记录中跟踪。
 
 ## 开发验证
 
